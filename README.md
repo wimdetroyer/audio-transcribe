@@ -4,6 +4,19 @@ Transcribe audio files or YouTube videos locally using whisper.cpp with Apple Si
 
 ## Install
 
+### Homebrew (recommended)
+
+```bash
+brew install wimdetroyer/toolz/audio-transcribe
+audio-transcribe setup
+```
+
+Dependencies (ffmpeg, whisper-cpp, yt-dlp) are installed automatically. The
+`setup` step then downloads the whisper large-v3 model (~3 GB), stored in
+`~/.whisper/models/`.
+
+### Manual
+
 ```bash
 git clone https://github.com/wimdetroyer/audio-transcribe.git
 cp audio-transcribe/bin/audio-transcribe /usr/local/bin/
@@ -17,8 +30,6 @@ curl -fsSL https://raw.githubusercontent.com/wimdetroyer/audio-transcribe/main/b
   -o /usr/local/bin/audio-transcribe && chmod +x /usr/local/bin/audio-transcribe
 audio-transcribe setup
 ```
-
-The `setup` step downloads the whisper model (~3 GB).
 
 ## Usage
 
