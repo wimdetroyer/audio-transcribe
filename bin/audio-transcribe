@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="1.0.0"
+
+WHISPER_DIR="$HOME/.whisper"
+WHISPER_REPO="$WHISPER_DIR/whisper.cpp"
+WHISPER_CLI_LOCAL="$WHISPER_REPO/build/bin/whisper-cli"
+MODEL="$WHISPER_DIR/models/ggml-large-v3.bin"
+THREADS=4
+TMPWAV=""
+TMPYTDIR=""
+
+# Resolve whisper-cli: prefer system-installed, fall back to local build
+if command -v whisper-cli &>/dev/null; then
+    WHISPER_CLI="$(command -v whisper-cli)"
+else
+    WHISPER_CLI="$WHISPER_CLI_LOCAL"
+fi
+
+cleanup() {
+    [ -n "$TMPWAV" ] && rm -f "$TMPWAV" || true
+    [ -n "$TMPYTDIR" ] && rm -rf "$TMPYTDIR" || true
+}
+trap cleanup EXIT
+
+usage() {
+    cat <<EOF
+Usage: audio-transcribe [options] <audio-file-or-youtube-url>
+       audio-transcribe setup
+
+Transcribe audio files or YouTube videos using whisper.cpp (Apple Silicon accelerated).
+
+Commands:
+  setup              Download the large-v3 model (and build whisper.cpp if not system-installed)
+  <audio-file>       Transcribe the given file (any ffmpeg-supported format)
+  <youtube-url>      Download and transcribe a YouTube video
+
+Options:
+  -l LANG            Language hint (e.g. en, nl, fr, de)
+  -h, --help         Show this help message
+  -v, --version      Show version
+
+How it works:
+  Runs whisper.cpp locally on Apple Silicon (Metal GPU acceleration).
+  Model: large-v3 (~3 GB), stored in ~/.whisper/models/
+  Audio is converted to 16kHz WAV via ffmpeg, then transcribed by whisper-cli.
+  No internet required after setup. No usage limits.
+
+Dependencies: ffmpeg, whisper-cpp (or git + cmake to build from source)
+              yt-dlp for YouTube support
+EOF
+    exit 0
+}
+
+check_dep() {
+    if ! command -v "$1" &>/dev/null; then
+        echo "Error: '$1' is required but not found. Please install it using your package manager." >&2
+        exit 1
+    fi
+}
+
+is_youtube_url() {
+    [[ "$1" =~ ^https?://(www\.)?(youtube\.com|youtu\.be)/ ]]
+}
+
+download_youtube_audio() {
+    local url="$1"
+    TMPYTDIR=$(mktemp -d /tmp/yt-audio-XXXXXXXX)
+    echo "Downloading audio from YouTube..."
+    yt-dlp \
+        --extract-audio \
+        --no-playlist \
+        --output "$TMPYTDIR/audio.%(ext)s" \
+        "$url"
+}
+
+cmd_setup() {
+    check_dep ffmpeg
+
+    mkdir -p "$WHISPER_DIR/models"
+
+    # If whisper-cli is already on PATH (e.g. via brew install whisper-cpp),
+    # skip the clone/build step and only download the model.
+    if command -v whisper-cli &>/dev/null; then
+        echo "System whisper-cli found at $(command -v whisper-cli), skipping build."
+    else
+        check_dep git
+        check_dep cmake
+
+        # Clone whisper.cpp
+        if [ -d "$WHISPER_REPO" ]; then
+            echo "whisper.cpp already cloned, pulling latest..."
+            git -C "$WHISPER_REPO" pull
+        else
+            echo "Cloning whisper.cpp..."
+            git clone https://github.com/ggerganov/whisper.cpp.git "$WHISPER_REPO"
+        fi
+
+        # Build
+        echo "Building whisper.cpp..."
+        cmake -S "$WHISPER_REPO" -B "$WHISPER_REPO/build" -DCMAKE_BUILD_TYPE=Release
+        cmake --build "$WHISPER_REPO/build" --config Release -j "$(sysctl -n hw.ncpu)"
+    fi
+
+    # Download model
+    if [ -f "$MODEL" ]; then
+        echo "Model already downloaded: $MODEL"
+    else
+        echo "Downloading large-v3 model (~3 GB)..."
+        if [ -d "$WHISPER_REPO" ]; then
+            bash "$WHISPER_REPO/models/download-ggml-model.sh" large-v3
+            mv "$WHISPER_REPO/models/ggml-large-v3.bin" "$MODEL"
+        else
+            # Download model directly when using system whisper-cli
+            local model_url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"
+            curl -L -o "$MODEL" "$model_url"
+        fi
+    fi
+
+    echo "Setup complete."
+}
+
+cmd_transcribe() {
+    local lang=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -l)
+                lang="$2"
+                shift 2
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [ $# -eq 0 ]; then
+        echo "Error: no audio file specified." >&2
+        usage
+    fi
+
+    local input="$1"
+
+    if is_youtube_url "$input"; then
+        check_dep yt-dlp
+        download_youtube_audio "$input"
+        input=("$TMPYTDIR"/audio.*)
+        input="${input[0]}"
+    elif [ ! -f "$input" ]; then
+        echo "Error: file not found: $input" >&2
+        exit 1
+    fi
+
+    if [ ! -x "$WHISPER_CLI" ]; then
+        echo "Error: whisper-cli not found. Install whisper-cpp or run 'audio-transcribe setup'." >&2
+        exit 1
+    fi
+
+    # Convert to 16kHz WAV (whisper requirement)
+    TMPWAV=$(mktemp /tmp/whisper-XXXXXXXX)
+    mv "$TMPWAV" "$TMPWAV.wav"
+    TMPWAV="$TMPWAV.wav"
+
+    ffmpeg -y -i "$input" -ar 16000 -ac 1 -c:a pcm_s16le "$TMPWAV" -loglevel error
+
+    # Build whisper-cli args
+    local args=(
+        --model "$MODEL"
+        --threads "$THREADS"
+        --print-progress
+        --file "$TMPWAV"
+    )
+
+    if [ -n "$lang" ]; then
+        args+=(--language "$lang")
+    fi
+
+    "$WHISPER_CLI" "${args[@]}" 2>/dev/null
+}
+
+# Main
+case "${1:-}" in
+    -h|--help)
+        usage
+        ;;
+    -v|--version)
+        echo "audio-transcribe $VERSION"
+        exit 0
+        ;;
+    setup)
+        cmd_setup
+        ;;
+    "")
+        usage
+        ;;
+    *)
+        cmd_transcribe "$@"
+        ;;
+esac
